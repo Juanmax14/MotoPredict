@@ -1,5 +1,8 @@
-
-# MOTOPREDICT — MODELO DE PREDICCIÓN CON MACHINE LEARNING
+# ============================================================
+# MOTOPREDICT — Modelo de predicción con Machine Learning
+# Entrena un modelo de Regresión Logística por cada componente
+# y predice si requiere mantenimiento según los datos del usuario.
+# ============================================================
 
 import threading
 import numpy as np
@@ -10,6 +13,9 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
 
+# ── Configuración de componentes ─────────────────────────────
+
+# Intervalo recomendado (en km) para cada componente
 componentes = {
     "aceite_motor":        3000,
     "cadena_transmision":  1000,
@@ -18,6 +24,7 @@ componentes = {
     "frenos":              3000
 }
 
+# Nombre e icono legibles para mostrar en la interfaz
 NOMBRES_COMPONENTES = {
     "aceite_motor":        "Aceite Motor",
     "cadena_transmision":  "Cadena Transmisión",
@@ -34,6 +41,7 @@ ICONOS_COMPONENTES = {
     "frenos":              "🛑"
 }
 
+# Mensajes personalizados por componente y nivel de riesgo
 MENSAJES = {
     "aceite_motor": {
         "ALTO":  "El aceite motor superó su vida útil. Rodar así puede causar daño severo al motor por falta de lubricación. Ve al taller hoy mismo.",
@@ -62,14 +70,23 @@ MENSAJES = {
     },
 }
 
-# Orden de columnas que espera el escalador (debe coincidir con el entrenamiento)
+# El orden importa: debe coincidir exactamente con el orden
+# en que se entrenó el StandardScaler.
 COLUMNAS_MODELO = ["kilometraje_actual", "km_desde_servicio", "km_por_dia", "consumo_anormal"]
 
-_modelos_cache = {}
-_lock = threading.Lock()
 
+# ── Caché de modelos entrenados ──────────────────────────────
+
+# Se llena la primera vez que se hace una predicción y se reutiliza
+# en todas las solicitudes siguientes.
+_modelos_cache = {}
+_lock = threading.Lock()  # protege contra condición de carrera en el primer request
+
+
+# ── Entrenamiento ────────────────────────────────────────────
 
 def _entrenar():
+    """Lee el dataset y entrena un modelo por cada componente."""
     dataset = pd.read_excel("dataset_motopredict.xlsx")
 
     for componente in componentes:
@@ -78,14 +95,21 @@ def _entrenar():
         X = datos[COLUMNAS_MODELO]
         y = datos["necesita_mantenimiento"]
 
+        # 70% entrenamiento / 30% prueba. random_state fija el resultado
+        # para que las métricas sean reproducibles entre ejecuciones.
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.30, random_state=42
         )
 
-        escalador    = StandardScaler()
-        X_train_esc  = escalador.fit_transform(X_train)
-        X_test_esc   = escalador.transform(X_test)
+        # StandardScaler lleva los datos a media=0 y desviación=1.
+        # Solo se ajusta (fit) con datos de entrenamiento para no
+        # "filtrar" información del conjunto de prueba.
+        escalador   = StandardScaler()
+        X_train_esc = escalador.fit_transform(X_train)
+        X_test_esc  = escalador.transform(X_test)
 
+        # class_weight="balanced" corrige el desbalance de clases
+        # (hay más casos "no necesita" que "sí necesita" en el dataset).
         modelo = LogisticRegression(max_iter=1000, class_weight="balanced")
         modelo.fit(X_train_esc, y_train)
 
@@ -103,12 +127,18 @@ def _entrenar():
         }
 
 
+# ── Predicción ───────────────────────────────────────────────
+
 def estimar_km_desde_servicio(kilometraje_actual, intervalo):
+    # El módulo (%) calcula cuántos km lleva dentro del ciclo actual.
+    # Ejemplo: 8900 km con intervalo 3000 → 8900 % 3000 = 2900 km usados.
     return kilometraje_actual % intervalo
 
 
 def entrenar_y_predecir(kilometraje_actual, km_por_dia, consumo_anormal):
-    # Double-checked locking: thread-safe lazy init
+    # Double-checked locking: si dos requests llegan al mismo tiempo
+    # antes de entrenar, solo uno ejecuta _entrenar(). El segundo
+    # espera y luego encuentra el caché ya lleno.
     if not _modelos_cache:
         with _lock:
             if not _modelos_cache:
@@ -119,8 +149,8 @@ def entrenar_y_predecir(kilometraje_actual, km_por_dia, consumo_anormal):
     componente_urgente = nombre_urgente = icono_urgente = ""
     metricas_por_comp  = []
 
-    # Fila base reutilizable: [km_actual, km_desde_servicio, km_dia, consumo]
-    # km_desde_servicio (índice 1) varía por componente; el resto es constante
+    # Array reutilizable para los 5 componentes. Solo cambia
+    # km_desde_servicio (índice 1) en cada iteración.
     fila_base = np.array([[float(kilometraje_actual), 0.0, float(km_por_dia), float(consumo_anormal)]])
 
     for componente, intervalo in componentes.items():
@@ -135,16 +165,19 @@ def entrenar_y_predecir(kilometraje_actual, km_por_dia, consumo_anormal):
             **met,
         })
 
+        # Cálculos preventivos basados en el ciclo de mantenimiento
         km_desde_servicio = estimar_km_desde_servicio(kilometraje_actual, intervalo)
         porcentaje_usado  = (km_desde_servicio / intervalo) * 100
         km_restantes      = intervalo - km_desde_servicio
         dias_restantes    = km_restantes / km_por_dia if km_por_dia > 0 else 999
 
+        # Predicción del modelo para este componente
         fila_base[0, 1] = float(km_desde_servicio)
         datos_esc        = escalador.transform(fila_base)
         prediccion       = modelo.predict(datos_esc)[0]
-        probabilidad     = modelo.predict_proba(datos_esc)[0][1] * 100
+        probabilidad     = modelo.predict_proba(datos_esc)[0][1] * 100  # probabilidad de clase 1
 
+        # Nivel de riesgo combinando uso del ciclo y consumo anormal
         if porcentaje_usado >= 90 or consumo_anormal == 1:
             riesgo = "ALTO"
         elif porcentaje_usado >= 75:
@@ -152,6 +185,8 @@ def entrenar_y_predecir(kilometraje_actual, km_por_dia, consumo_anormal):
         else:
             riesgo = "BAJO"
 
+        # Decisión final: ML + regla preventiva al 85% del ciclo
+        # Más conservador que el modelo solo — prioriza la seguridad.
         if prediccion == 1 or porcentaje_usado >= 85 or consumo_anormal == 1:
             decision, decision_ok = "Requiere mantenimiento", False
         else:
@@ -160,6 +195,7 @@ def entrenar_y_predecir(kilometraje_actual, km_por_dia, consumo_anormal):
         nombre        = NOMBRES_COMPONENTES[componente]
         recomendacion = MENSAJES[componente][riesgo]
 
+        # Identifica el componente con mayor probabilidad para el resumen ejecutivo
         if probabilidad > mayor_probabilidad:
             mayor_probabilidad = probabilidad
             componente_urgente = componente
@@ -181,6 +217,7 @@ def entrenar_y_predecir(kilometraje_actual, km_por_dia, consumo_anormal):
             "intervalo_km":     intervalo,
         })
 
+    # Promedio de métricas globales calculado directamente del caché
     metricas_resumen = {
         k: round(sum(c["metricas"][k] for c in _modelos_cache.values()) / len(_modelos_cache), 1)
         for k in ("accuracy", "precision", "recall", "f1")
